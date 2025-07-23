@@ -42,26 +42,58 @@ class WorktreeItem extends vscode.TreeItem {
   }
 }
 
+// ディレクトリを再帰的にコピーする関数
+function copyDirectoryRecursive(source: string, target: string): void {
+  // ターゲットディレクトリを作成
+  if (!fs.existsSync(target)) {
+    fs.mkdirSync(target, { recursive: true });
+  }
+
+  // ソースディレクトリの内容を読み取る
+  const files = fs.readdirSync(source, { withFileTypes: true });
+
+  for (const file of files) {
+    const sourcePath = path.join(source, file.name);
+    const targetPath = path.join(target, file.name);
+
+    if (file.isDirectory()) {
+      // ディレクトリの場合は再帰的にコピー
+      copyDirectoryRecursive(sourcePath, targetPath);
+    } else {
+      // ファイルの場合はコピー
+      fs.copyFileSync(sourcePath, targetPath);
+    }
+  }
+}
+
 // ローカルファイルをコピーする関数
 async function copyLocalFiles(sourcePath: string, targetPath: string): Promise<void> {
   try {
     for (const pattern of getLocalFilePatterns()) {
-      const sourceFiles = await findMatchingFiles(sourcePath, pattern);
+      const sourceEntries = await findMatchingEntries(sourcePath, pattern);
 
-      for (const sourceFile of sourceFiles) {
-        const relativePath = path.relative(sourcePath, sourceFile);
-        const targetFile = path.join(targetPath, relativePath);
+      for (const sourceEntry of sourceEntries) {
+        const relativePath = path.relative(sourcePath, sourceEntry);
+        const targetEntry = path.join(targetPath, relativePath);
 
-        // ターゲットディレクトリが存在しない場合は作成
-        const targetDir = path.dirname(targetFile);
-        if (!fs.existsSync(targetDir)) {
-          fs.mkdirSync(targetDir, { recursive: true });
-        }
+        // エントリの情報を取得
+        const stat = fs.statSync(sourceEntry);
 
-        // ファイルをコピー
-        if (fs.existsSync(sourceFile)) {
-          fs.copyFileSync(sourceFile, targetFile);
-          console.log(`Copied local file: ${relativePath}`);
+        if (stat.isDirectory()) {
+          // ディレクトリの場合は再帰的にコピー
+          console.log(`Copying directory: ${relativePath}`);
+          copyDirectoryRecursive(sourceEntry, targetEntry);
+        } else {
+          // ファイルの場合
+          // ターゲットディレクトリが存在しない場合は作成
+          const targetDir = path.dirname(targetEntry);
+          if (!fs.existsSync(targetDir)) {
+            fs.mkdirSync(targetDir, { recursive: true });
+          }
+
+          // ファイルをコピー
+          fs.copyFileSync(sourceEntry, targetEntry);
+          console.log(`Copied file: ${relativePath}`);
         }
       }
     }
@@ -71,36 +103,47 @@ async function copyLocalFiles(sourcePath: string, targetPath: string): Promise<v
   }
 }
 
-async function findMatchingFiles(basePath: string, pattern: string): Promise<string[]> {
-  const matchingFiles: string[] = [];
+async function findMatchingEntries(basePath: string, pattern: string): Promise<string[]> {
+  const matchingEntries: string[] = [];
 
   try {
     // glob的なパターンマッチングを簡易実装
     if (pattern.includes("*")) {
-      const files = await getAllFiles(basePath);
+      const entries = await getAllEntries(basePath, [], pattern);
       const regex = patternToRegex(pattern);
 
-      for (const file of files) {
-        const relativePath = path.relative(basePath, file);
-        if (regex.test(relativePath)) {
-          matchingFiles.push(file);
+      for (const entry of entries) {
+        const relativePath = path.relative(basePath, entry);
+        // Windows環境でもUnix形式のパスセパレータに統一
+        const normalizedPath = relativePath.replace(/\\/g, '/');
+        
+        // デバッグログ
+        if (pattern.includes('.env') || pattern.includes('node_modules')) {
+          console.log(`[findMatchingEntries] Testing pattern: ${pattern} against path: ${normalizedPath}`);
+          console.log(`[findMatchingEntries] Regex test result: ${regex.test(normalizedPath)}`);
+          console.log(`[findMatchingEntries] Entry type: ${fs.statSync(entry).isDirectory() ? 'directory' : 'file'}`);
+        }
+        
+        if (regex.test(normalizedPath)) {
+          matchingEntries.push(entry);
+          console.log(`[findMatchingEntries] MATCHED: ${normalizedPath} with pattern: ${pattern}`);
         }
       }
     } else {
       // 直接パス指定の場合
       const fullPath = path.join(basePath, pattern);
       if (fs.existsSync(fullPath)) {
-        matchingFiles.push(fullPath);
+        matchingEntries.push(fullPath);
       }
     }
   } catch (error) {
-    console.error(`Error finding files for pattern ${pattern}:`, error);
+    console.error(`Error finding entries for pattern ${pattern}:`, error);
   }
 
-  return matchingFiles;
+  return matchingEntries;
 }
 
-async function getAllFiles(dir: string, files: string[] = []): Promise<string[]> {
+async function getAllEntries(dir: string, entries: string[] = [], pattern?: string): Promise<string[]> {
   try {
     const dirents = fs.readdirSync(dir, { withFileTypes: true });
 
@@ -108,25 +151,72 @@ async function getAllFiles(dir: string, files: string[] = []): Promise<string[]>
       const fullPath = path.join(dir, dirent.name);
 
       if (dirent.isDirectory()) {
-        // .git ディレクトリなどは除外
-        if (!dirent.name.startsWith(".git") && dirent.name !== "node_modules") {
-          await getAllFiles(fullPath, files);
+        // パフォーマンスのため、大きなディレクトリは除外
+        const excludeDirs = ["node_modules", ".next", "dist", "build", "out"];
+        
+        // パターンが明示的に除外ディレクトリを指定している場合は、除外しない
+        const shouldExclude = !pattern || !excludeDirs.some(excludeDir => {
+          // パターンが除外ディレクトリを含んでいるかチェック
+          const normalizedPattern = pattern.replace(/\\/g, '/');
+          return normalizedPattern.includes(excludeDir);
+        });
+        
+        // .gitは除外しない（.git内のファイルも検索対象にする）
+        if (shouldExclude && !excludeDirs.includes(dirent.name) && !dirent.name.startsWith(".git")) {
+          // ディレクトリ自体もエントリとして追加
+          entries.push(fullPath);
+          // 再帰的に中身も取得
+          await getAllEntries(fullPath, entries, pattern);
+        } else if (!shouldExclude) {
+          // パターンが除外ディレクトリを含む場合は、除外せずに追加
+          entries.push(fullPath);
+          await getAllEntries(fullPath, entries, pattern);
         }
       } else {
-        files.push(fullPath);
+        entries.push(fullPath);
       }
     }
   } catch (error) {
     // ディレクトリアクセスエラーは無視
   }
 
-  return files;
+  return entries;
 }
 
 function patternToRegex(pattern: string): RegExp {
-  // 簡易的なglob to regex変換
-  let regexPattern = pattern.replace(/\./g, "\\.").replace(/\*/g, ".*").replace(/\?/g, ".");
-
+  // Windows環境でもUnix形式のパスセパレータに統一
+  pattern = pattern.replace(/\\/g, '/');
+  
+  // デバッグログ
+  console.log(`[patternToRegex] Original pattern: ${pattern}`);
+  
+  // 先頭に ** がある場合の特別処理
+  if (pattern.startsWith('**/')) {
+    // **/.env -> (.env|.+/.env) のようなパターンを生成
+    const remainingPattern = pattern.substring(3); // **/ を除去
+    const escapedPattern = remainingPattern
+      .replace(/\./g, "\\.")  // . をエスケープ
+      .replace(/\*\*/g, "{{GLOBSTAR}}")  // ** を一時的にマーク
+      .replace(/\*/g, "[^/]*")  // * は / 以外の任意の文字
+      .replace(/{{GLOBSTAR}}/g, ".*")  // ** は任意の文字（/ を含む）
+      .replace(/\?/g, "[^/]");  // ? は / 以外の単一文字
+    
+    // ルートレベルまたは任意のサブディレクトリにマッチ
+    const regexPattern = `(.*\\/)?${escapedPattern}`;
+    console.log(`[patternToRegex] Generated regex: ^${regexPattern}$`);
+    return new RegExp(`^${regexPattern}$`);
+  }
+  
+  // 通常のパターン処理
+  let regexPattern = pattern
+    .replace(/\./g, "\\.")           // . をエスケープ
+    .replace(/\*\*/g, "{{GLOBSTAR}}")  // ** を一時的にマーク
+    .replace(/\*/g, "[^/]*")          // * は / 以外の任意の文字
+    .replace(/{{GLOBSTAR}}/g, ".*")  // ** は任意の文字（/ を含む）
+    .replace(/\?/g, "[^/]");          // ? は / 以外の単一文字
+  
+  console.log(`[patternToRegex] Generated regex: ^${regexPattern}$`);
+  
   return new RegExp(`^${regexPattern}$`);
 }
 
@@ -300,9 +390,17 @@ export function activate(context: vscode.ExtensionContext) {
             } catch (cursorError) {
               // If the cursor cannot be found, a warning is displayed but processing continues.
               console.warn("Cursor command failed:", cursorError);
-              vscode.window.showWarningMessage(
-                "Worktree created successfully, but failed to open in Cursor. Please open manually."
-              );
+              
+              // 代替方法：現在のエディタ（Cursor）で新しいウィンドウを開く
+              try {
+                // true を指定することで新しいウィンドウで開く
+                await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(worktreePath), true);
+              } catch (vscodeError) {
+                console.warn("Failed to open new window:", vscodeError);
+                vscode.window.showWarningMessage(
+                  "Worktree created successfully, but failed to open in Cursor. Please open manually."
+                );
+              }
             }
 
             progress.report({ increment: 100, message: "Complete!" });
